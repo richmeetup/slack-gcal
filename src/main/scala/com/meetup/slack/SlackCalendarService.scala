@@ -31,10 +31,12 @@ trait SlackCalendarService extends HttpService {
   type TimePeriod = (LocalDateTime, LocalDateTime) // begin, end
 
   val durationMinutes = 30
+  val serverRootUrl = "http://localhost:8080" // "https://<something>.ngrok.io"
 
   // XXX - this store needs to change
   val credentialsStore = {
-    MemoryDataStoreFactory.getDefaultInstance
+    new FileDataStoreFactory(new File("/tmp"))
+    //MemoryDataStoreFactory.getDefaultInstance
   }
 
   val clientSecrets = {
@@ -56,7 +58,7 @@ trait SlackCalendarService extends HttpService {
       .build()
   }
 
-  val redirectUri = Uri("http://localhost:8080/oauthcallback").toString
+  val redirectUri = Uri(s"${serverRootUrl}/oauthcallback").toString
 
   def encodeState(userId: String,
                   command: String,
@@ -79,10 +81,12 @@ trait SlackCalendarService extends HttpService {
     val state = encodeState(userId, command, text)
 
     Option(authFlow.loadCredential(userId)).toRight {
-      redirect(authFlow.newAuthorizationUrl
+      val authorizationUrl = authFlow.newAuthorizationUrl
         .setRedirectUri(redirectUri)
-        .setState(state).toString,
-        StatusCodes.TemporaryRedirect)
+        .setState(state).toString
+      complete {
+        s"<$authorizationUrl|Click here to authenticate with slack-gcal.>"
+      }
     }
   }
 
@@ -110,23 +114,21 @@ trait SlackCalendarService extends HttpService {
     ).setApplicationName("slack-gcal").build()
 
     command match {
-      case "whereis" =>
+      case "/whereis" =>
         whereIs(api, userId, text)
-      case "bookroom" =>
+      case "/bookroom" =>
         bookRoom(api, userId, text)
-      case "findtimes" =>
-        findTimes(api, userId, text)
-      case "meetwith" =>
-        meetWith(api, userId, text)
+      case "/findtimes" =>
+        text.split(" ").toList match {
+          case (attendeesString :: time :: _) =>
+            meetWith(api, userId, attendeesString, time)
+          case (attendeesString :: _) =>
+            findTimes(api, userId, attendeesString)
+        }
       case _ =>
         failWith(new IllegalRequestException(StatusCodes.BadRequest))
     }
   }
-
-  // XXX - should do post... but doing get for now for the gcal oauth2 flow
-  //    post {
-  //      formFields('user_name, 'command, 'text) { (userId, command, text) =
-
 
   val route =
     path("") {
@@ -150,13 +152,9 @@ trait SlackCalendarService extends HttpService {
             case Left(route) => route
             case Right(credential) => {
               val (userId, command, text) = decodeState(state)
-              //routeCommand(credential, command, userId, text)
-              redirect(
-                Uri("http://localhost:8080").withQuery(
-                  "user_name" -> userId,
-                  "command" -> command,
-                  "text" -> text).toString,
-                StatusCodes.TemporaryRedirect)
+              complete {
+                "All set. Start using /findtimes!"
+              }
             }
           }
         }
@@ -183,7 +181,7 @@ trait SlackCalendarService extends HttpService {
       .format(startTime.atZone(ZoneId.systemDefault()))
     val text = s"${attendees} ${startTimeFormatted}"
 
-    Uri("http://localhost:8080")
+    Uri(s"${serverRootUrl}/")
       .withQuery(
         "user_name" -> userId,
         "command" -> "meetwith",
@@ -192,17 +190,17 @@ trait SlackCalendarService extends HttpService {
   }
 
   /**
-   * /meetwith <username>,<username>,... <time>
-   *
-   * Schedules free time with the <usernames> as attendees.
+   * Finds free time with the <usernames> as attendees.
    */
-  def meetWith(api: GCalendarService, userId: String, text: String): StandardRoute = {
-    val (attendeesString :: time :: _) = text.split(" ").toList
+  def meetWith(api: GCalendarService,
+               userId: String,
+               attendeesString: String,
+               time: String): StandardRoute = {
 
     val calendarId = s"${userId}@meetup.com"
     val attendees = (List(userId) ++ attendeesString.split(",").toList).map { name =>
       new EventAttendee()
-        .setEmail(s"${name}@meetup.com")
+        .setEmail(s"${name.replace("@", "")}@meetup.com")
     }
 
     val jStartTime = Instant.parse(time)
@@ -229,11 +227,7 @@ trait SlackCalendarService extends HttpService {
       .execute()) match {
       case Success(result) =>
         complete {
-          <body>
-            <html>
-              <a href={result.getHtmlLink}>Event created!</a>
-            </html>
-          </body>
+          s"<${result.getHtmlLink}|Event created!>"
         }
       case Failure(e) =>
         System.out.println(e)
@@ -246,8 +240,10 @@ trait SlackCalendarService extends HttpService {
    *
    * Find free time slots with userId and all usernames present.
    */
-  def findTimes(api: GCalendarService, userId: String, text: String): StandardRoute = {
-    val attendees = (List(userId) ++ text.split(",").toList).map { name =>
+  def findTimes(api: GCalendarService,
+                userId: String,
+                attendeesString: String): StandardRoute = {
+    val attendees = (List(userId) ++ attendeesString.split(",").toList).map { name =>
       new FreeBusyRequestItem().setId(s"${name}@meetup.com")
     }
 
@@ -291,22 +287,13 @@ trait SlackCalendarService extends HttpService {
           calculateFreeTimes(minDate, maxDate, durationMinutes, busyTimes)
 
         val dateFormat = DateTimeFormatter.ofPattern("EEEE, MMMM d, h:mm a")
+        val isoFormat = DateTimeFormatter.ISO_INSTANT
 
         complete {
-          <html>
-            <body>
-              <h1>
-                Found {freeTimes.length} free slots for {members.mkString(", ")} for {durationMinutes} minutes!
-              </h1>
-              <ul>
-                {freeTimes.map(freeTime =>
-                  <li>
-                    {dateFormat.format(freeTime._1)}
-                    <a href={generateMeetWithLink(userId, text, freeTime._1)}>Book it!</a>
-                  </li>)}
-              </ul>
-            </body>
-          </html>
+          s"""Found *${freeTimes.length} free slots* for a ${durationMinutes}-minute meeting. Here are the Top 10:
+          ```${freeTimes.take(10).map(freeTime =>
+            s"(${isoFormat.format(freeTime._1.atZone(ZoneId.systemDefault()).toInstant)})" +
+            s" ${dateFormat.format(freeTime._1)}").mkString("\n")}```"""
         }
       case Failure(e) =>
         System.out.println(e)
